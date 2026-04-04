@@ -33,7 +33,7 @@ class RecipeStep:
         mass = 0.0
         details = {'ingredients': [], 'appliance': None}
         
-        # 食材计算
+        # Ingredient calculation
         for item in self.inputs:
             ing = item['ingredient']
             amt = item['amount']
@@ -49,7 +49,7 @@ class RecipeStep:
                 'emission': ing_emission
             })
             
-        # 能耗计算
+        # Energy consumption calculation
         if self.appliance and self.time > 0:
             app_emission = self.appliance.co2_per_hour * (self.time / 60.0)
             emissions += app_emission
@@ -113,17 +113,17 @@ class Recipe:
         }
 
 # ==========================================
-# NEW: 真实数据管理器 (Data Loading Layer)
+# NEW: Real data manager (Data Loading Layer)
 # ==========================================
 
 class DataManager:
     def __init__(self):
-        self.ingredients_db = {} # 字典 {name: IngredientObject}
-        self.appliances_db = {}  # 字典 {name: ApplianceObject}
-        self.menu_list = []      # 列表 [RecipeObject]
+        self.ingredients_db = {} # Dictionary {name: IngredientObject}
+        self.appliances_db = {}  # Dictionary {name: ApplianceObject}
+        self.menu_list = []      # List [RecipeObject]
 
     def load_ingredients(self, filepath):
-        """读取 CSV 并通过 Pandas 转换为 Ingredient 对象"""
+        """Read CSV and convert it into Ingredient objects using Pandas"""
         if not os.path.exists(filepath):
             print(f"Error: File {filepath} not found.")
             return
@@ -139,7 +139,7 @@ class DataManager:
             self.ingredients_db[row['name']] = ing
 
     def load_appliances(self, filepath):
-        """读取 CSV 并转换为 Appliance 对象"""
+        """Read CSV and convert it into Appliance objects"""
         if not os.path.exists(filepath): return
         
         df = pd.read_csv(filepath)
@@ -153,7 +153,7 @@ class DataManager:
             self.appliances_db[row['name']] = app
 
     def build_menu_from_json(self, filepath):
-        """读取 JSON 并利用已加载的 DB 构建单向 Recipe"""
+        """Read JSON and use the already loaded databases to build one-way Recipe objects"""
         if not os.path.exists(filepath): return
         
         with open(filepath, 'r') as f:
@@ -162,23 +162,23 @@ class DataManager:
         print(f"Building {len(data)} recipes...")
         
         for recipe_data in data:
-            # 1. 创建菜品对象
+            # 1. Create dish object
             dish = Recipe(recipe_data['name'], recipe_data['price'])
             
-            # 2. 遍历 JSON 中的步骤 (Steps)
+            # 2. Iterate through the steps in the JSON
             for step in recipe_data['steps']:
-                # 查找对应的设备对象 (如果找不到，默认 None)
+                # Find the corresponding appliance object (default to None if not found)
                 app_name = step.get('appliance')
                 app_obj = self.appliances_db.get(app_name)
                 
                 if app_name and not app_obj:
                     print(f"Warning: Appliance '{app_name}' not found in DB.")
 
-                # 创建节点
+                # Create node
                 step_obj_inst = RecipeStep(step['step_name'], step['description'], appliance=app_obj)
                 step_obj_inst.set_duration(time_min=step['time_min'])
                 
-                # 3. 遍历步骤中的食材并添加到节点
+                # 3. Iterate through the ingredients in the step and add them to the node
                 if 'ingredients' in step:
                     for ing_item in step['ingredients']:
                         ing_name = ing_item['name']
@@ -197,7 +197,7 @@ class DataManager:
             self.menu_list.append(dish)
 
 # ==========================================
-# 运行主程序
+# Run main program
 # ==========================================
 
 from optimization import ParetoAnalyzer
@@ -205,15 +205,15 @@ from optimization import ParetoAnalyzer
 def run_real_world_simulation():
     manager = DataManager()
     
-    # 1. 加载基础数据 (请确保 csv 文件在同级目录)
-    # 你可以先用 Excel 制作这些 csv，然后另存为 CSV UTF-8 格式
+    # 1. Load base data (make sure the CSV files are in the same directory)
+    # You can first create these CSV files in Excel, then save them as CSV UTF-8 format
     manager.load_ingredients('db_ingredients.csv')
     manager.load_appliances('db_appliances.csv')
     
-    # 2. 构建菜单图模型
+    # 2. Build the menu graph model
     manager.build_menu_from_json('db_recipes.json')
     
-    # 3. 输出结果
+    # 3. Output results
     print("\n" + "="*40)
     print("       MENU ANALYSIS REPORT       ")
     print("="*40)
@@ -247,10 +247,10 @@ def run_real_world_simulation():
                     print(f"      - {app['name']}: {round(app['emission'], 3)} kgCO2e "
                           f"({app['time_min']} min)")
 
-    # 如果你想把结果存回 CSV 用于论文图表：
+    # If you want to save the results back to CSV for paper figures:
     # pd.DataFrame(results_df).to_csv('final_results.csv', index=False)
     
-    # 4. 运行优化分析 (Pareto Analysis)
+    # 4. Run optimization analysis (Pareto Analysis)
     print("\nRunning Multi-Objective Optimization...")
     optimizer = ParetoAnalyzer(manager.menu_list)
     optimizer.print_pareto_report()
@@ -263,7 +263,7 @@ if __name__ == "__main__":
 
     run_real_world_simulation()
 
-8.2	Optimization (optimization.py)
+1.1	Optimization (optimization.py)
 class ParetoAnalyzer:
     def __init__(self, menu_list, labor_rate_per_min=0.25):
         """
@@ -343,7 +343,7 @@ class ParetoAnalyzer:
         print("-" * 70)
         print(f"Optimal Lineup: {len(frontier)} recipes defining the modern frontier.")
 
-8.3	Dataset Matching (data_converter.py)
+1.2	Dataset Matching (data_converter.py)
 import pandas as pd
 import json
 import os
@@ -688,6 +688,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
