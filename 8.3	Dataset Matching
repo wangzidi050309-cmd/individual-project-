@@ -1,0 +1,490 @@
+import pandas as pd
+import json
+import os
+import ast
+import re
+import nltk
+from nltk.stem import WordNetLemmatizer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Download the wordnet dictionary
+nltk.download('wordnet')
+
+lemmatizer = WordNetLemmatizer()
+
+# Common mappings for Food.com -> Agribalyse
+MANUAL_ALIASES = {
+    "eggs": "egg, raw",
+    "egg": "egg, raw",
+    "butter": "butter, salted",
+    "sugar": "sugar, white",
+    "salt": "salt, white",
+    "flour": "wheat flour",
+    "all-purpose flour": "wheat flour",
+    "milk": "milk, semi-skimmed",
+    "water": "water, tap",
+    "oil": "sunflower oil",
+    "vegetable oil": "sunflower oil",
+    "olive oil": "olive oil",
+    "pepper": "black pepper",
+    "onion": "onion, raw",
+    "onions": "onion, raw",
+    "garlic": "garlic, raw",
+    "cloves": "clove",
+    "ground beef": "minced meat, beef, 15% fat, raw",
+    "chicken": "chicken, meat, raw",
+    "chicken breasts": "chicken, meat, raw",
+    "cheese": "emmental/swiss cheese",
+    "cheddar cheese": "cheddar",
+    "potatoes": "potato, raw",
+    "baking powder": "chemical raising agent, baking powder",
+}
+
+# Mapped Agribalyse "Groupe d'aliment" to standard reference weights (kg)
+AUTHORITATIVE_WEIGHTS_KG = {
+    "viandes, œufs, poissons": 0.115,               # Meat/Eggs/Fish (~115g)
+    "lait et produits laitiers": 0.050,             # Dairy (Cheese/Yogurt ~50g)
+    "fruits, légumes, légumineuses et oléagineux": 0.100, # Fruits, Veg, Nuts (~100g)
+    "produits céréaliers": 0.055,                   # Grains/Pasta/Rice (~55g)
+    "matières grasses": 0.015,                      # Fats/Oils/Butter (~15g or 1 tbsp)
+    "produits sucrés": 0.030,                       # Sugars/Sweets (~30g)
+    "aides culinaires et ingrédients divers": 0.005,# Spices/Condiments/Broth (~5g)
+    "boissons": 0.240,                              # Beverages/Liquids (~240g or 1 cup)
+    "entrées et plats composés": 0.200              # Mixed dishes fallback (~200g)
+}
+
+def clean_ingredient_name(name):
+    # Lowercase
+    name = str(name).lower()
+    # Remove things in parentheses (e.g. "milk (low fat)")
+    name = re.sub(r'\(.*?\)', '', name)
+    # Remove common irrelevant adjectives
+    words_to_remove = [
+        "fresh", "chopped", "minced", "diced", "sliced", "large", "small", "medium", 
+        "whole", "ground", "dried", "crushed", "shredded", "grated", "canned", 
+        "cup", "cups", "teaspoon", "tablespoon", "ounce", "ounces", "lb", "pound"
+    ]
+    for w in words_to_remove:
+        name = name.replace(f" {w} ", " ").replace(f"^{w} ", "").replace(f" {w}$", "")
+    
+    # --- NEW: NLP Lemmatization ---
+    # Split into words, lemmatize each word to its singular/base form, and rejoin
+    tokens = name.split()
+    lemmatized_tokens = [lemmatizer.lemmatize(word) for word in tokens]
+    
+    return " ".join(lemmatized_tokens).strip()
+
+# Paths
+AGRIBALYSE_PATH = 'agribalyse/Agribalyse_Synthese.csv'
+RECIPES_PATH = 'db_recipes/RAW_recipes.csv'
+UBER_EATS_PATH = 'uber_eats/restaurant-menus.csv'
+OUT_INGREDIENTS = 'db_ingredients.csv'
+OUT_APPLIANCES = 'db_appliances.csv'
+OUT_RECIPES = 'db_recipes.json'
+OUT_PRICES = 'db_prices.csv'
+
+def create_appliances_db():
+    print("Creating appliances database...")
+    appliances = [
+        {"name": "Oven", "kw": 2.0},       # Commercial oven ~3000W
+        {"name": "Stove", "kw": 1.7},      # Commercial burner ~2500W
+        {"name": "Microwave", "kw": 1.2},  # Commercial microwave ~1500W
+        {"name": "Toaster", "kw": 1.2},    # Commercial toaster ~1200W
+        {"name": "Fridge", "kw": 0.03},     # Refrigerator (allocated fraction)
+        {"name": "Prep Table", "kw": 0.0}, # No electricity
+    ]
+    df = pd.DataFrame(appliances)
+    df.to_csv('db_appliances.csv', index=False)
+
+def create_ingredients_db():
+    print("Creating ingredients database from Agribalyse...")
+    if not os.path.exists(AGRIBALYSE_PATH):
+        print(f"Error: {AGRIBALYSE_PATH} not found.")
+        return None
+
+    try:
+        df = pd.read_csv(AGRIBALYSE_PATH, low_memory=False)
+    except Exception as e:
+        print(f"Error reading Agribalyse: {e}")
+        return None
+
+    # Agribalyse columns: 'LCI Name' (English name), 'Changement climatique' (CO2)
+    ingredients = []
+    
+    for _, row in df.iterrows():
+        name = row['LCI Name'] if pd.notna(row['LCI Name']) else row['Nom du Produit en Français']
+        co2 = row['Changement climatique']
+        group = row["Groupe d'aliment"] if pd.notna(row.get("Groupe d'aliment")) else "Default"
+        
+        if pd.notna(name) and pd.notna(co2):
+            ingredients.append({
+                "name": str(name).strip(),
+                "co2_per_kg": float(co2),
+                "food_group": str(group)
+            })
+        
+    out_df = pd.DataFrame(ingredients)
+    out_df = out_df.drop_duplicates(subset=['name'])
+    out_df.to_csv(OUT_INGREDIENTS, index=False)
+    print(f"Saved {len(out_df)} ingredients to {OUT_INGREDIENTS}")
+    return out_df
+
+def create_prices_db():
+    print("Creating prices database from Uber Eats...")
+    
+    if os.path.exists(OUT_PRICES):
+        print(f"Loading existing prices from {OUT_PRICES}...")
+        return pd.read_csv(OUT_PRICES)
+        
+    if not os.path.exists(UBER_EATS_PATH):
+        print(f"Error: {UBER_EATS_PATH} not found.")
+        return None
+
+    try:
+        print("Reading Uber Eats CSV (this might take a few seconds)...")
+        # Read relevant columns
+        df = pd.read_csv(UBER_EATS_PATH, usecols=['name', 'price'])
+    except Exception as e:
+        print(f"Error reading Uber Eats: {e}")
+        return None
+        
+    # Clean price: remove ' USD' and convert to float
+    df = df.dropna(subset=['price', 'name'])
+    df['price'] = df['price'].astype(str).str.replace(' USD', '', regex=False)
+    df['price'] = pd.to_numeric(df['price'], errors='coerce')
+    df = df.dropna(subset=['price'])
+    
+    # Standardize names
+    df['name'] = df['name'].astype(str).str.strip().str.lower()
+    
+    # Group by name and calculate median price
+    print("Aggregating prices (median)...")
+    price_db = df.groupby('name')['price'].median().reset_index()
+    
+    # Save
+    price_db.to_csv(OUT_PRICES, index=False)
+    print(f"Saved {len(price_db)} prices to {OUT_PRICES}")
+    return price_db
+
+import re
+import ast
+import json
+import os
+import pandas as pd
+import difflib
+
+def extract_amount_from_step(ingredient_name, step_text, fallback_weight):
+    """
+    Searches a single recipe step for the ingredient and extracts the quantity and unit.
+    Converts fractions (1 / 2) to floats and normalizes to a base weight (kg).
+    """
+    text = step_text.lower()
+    ing_lower = str(ingredient_name).lower()
+    
+    # Regex Pattern: Matches numbers/fractions, optional units, and filler words before ingredient
+    pattern = r'((?:\d+\s+)?\d+\s*/\s*\d+|\d+(?:\.\d+)?)\s*(cup|tablespoon|tbsp|teaspoon|tsp|ounce|oz|pound|lb|gram|g|ml|l|liter|dash|pinch)?s?\b(?:[\w\s-]{0,25})?' + re.escape(ing_lower)
+    
+    match = re.search(pattern, text)
+    if not match:
+        return fallback_weight
+        
+    num_str = match.group(1).strip()
+    unit = match.group(2)
+    
+    # Clean and parse the number/fraction string
+    num_str = re.sub(r'\s*/\s*', '/', num_str)
+    parts = num_str.split()
+    val = 0.0
+    try:
+        for p in parts:
+            if '/' in p:
+                num, den = p.split('/')
+                val += float(num) / float(den)
+            else:
+                val += float(p)
+    except ValueError:
+        return fallback_weight
+        
+    conversion_to_kg = {
+        'cup': 0.24, 'tablespoon': 0.015, 'tbsp': 0.015,
+        'teaspoon': 0.005, 'tsp': 0.005, 'ounce': 0.028,
+        'oz': 0.028, 'pound': 0.453, 'lb': 0.453,
+        'gram': 0.001, 'g': 0.001, 'ml': 0.001,
+        'l': 1.0, 'liter': 1.0, 'dash': 0.001, 'pinch': 0.001
+    }
+    
+    if unit and unit in conversion_to_kg:
+        # print(step_text, '....', ingredient_name, val, unit)
+        return round(val * conversion_to_kg[unit], 3)
+    
+    return round(val * fallback_weight, 3)
+
+def process_recipes(ingredients_df):
+    print("Processing recipes...")
+    if not os.path.exists(RECIPES_PATH):
+        print(f"Error: {RECIPES_PATH} not found.")
+        return
+
+    # Load Prices
+    price_df = create_prices_db()
+    if price_df is None:
+        print("Cannot process recipes without price mapping.")
+        return
+        
+    price_map = {str(n).strip().lower(): p for n, p in zip(price_df['name'], price_df['price'])}
+    price_names_set = set(price_map.keys())
+
+    # Map lower-case name -> Proper LCI Name
+    agribalyse_map = {str(name).lower(): name for name in ingredients_df['name'].tolist() if pd.notna(name)}
+    agribalyse_names = list(agribalyse_map.keys())
+    agribalyse_group_map = {row['name']: row['food_group'] for _, row in ingredients_df.iterrows() if pd.notna(row['name'])}
+
+    # --- NEW: Normalize Agribalyse names for the TF-IDF Vocabulary ---
+    print("Normalizing vocabularies and building Word-Level TF-IDF Matrix...")
+    normalized_agribalyse_names = [clean_ingredient_name(name) for name in agribalyse_names]
+    
+    # Map the normalized names BACK to the original Agribalyse names 
+    # so we can retrieve the correct final name later
+    norm_to_original_map = {norm: orig for norm, orig in zip(normalized_agribalyse_names, agribalyse_names)}
+
+    # Use word analyzer with unigrams and bigrams
+    vectorizer = TfidfVectorizer(analyzer='word', ngram_range=(1, 2))
+    tfidf_matrix = vectorizer.fit_transform(normalized_agribalyse_names)
+    
+    # Load recipes. To be thoroughly exhaustive but efficient, filter to exact name hits first.
+    print("Loading Food.com recipes and intersecting with Uber Eats prices...")
+    df_recipes = pd.read_csv(RECIPES_PATH)
+    df_recipes['norm_name'] = df_recipes['name'].astype(str).str.lower().str.strip()
+    df_matched = df_recipes[df_recipes['norm_name'].isin(price_names_set)]
+    
+    recipes_list = []
+    match_cache = {}
+    
+    print(f"Found {len(df_matched)} out of {len(df_recipes)} recipes intersecting with prices. Checking ingredients...")
+    processed_count = 0
+    
+    for i, row in df_matched.iterrows():
+        processed_count += 1
+        # if processed_count > 1000 and len(recipes_list) >= 50:
+        #     # We want to output around 50 verified active recipes for the demo execution.
+        #     break
+
+        recipe_name = row['name']
+        minutes = row['minutes']
+        clean_r_name = row['norm_name']
+        
+        # Proper handling: Skip if no price (already guaranteed by intersection, but fetching it)
+        final_price = price_map.get(clean_r_name)
+        if final_price is None:
+            continue
+            
+        try:
+            ingr_list = ast.literal_eval(row['ingredients'])
+        except:
+            continue
+            
+        if not ingr_list:
+            continue
+            
+        recipe_dict = {
+            "id": str(row['id']),
+            "name": str(recipe_name).title(),
+            "price": final_price,
+            "price_source": "exact_match", # Strictly using the real price matches from Uber Eats
+            "steps": []
+        }
+
+        # --- PARSE NATURAL STEPS ---
+        try:
+            raw_steps = ast.literal_eval(row['steps'])
+        except:
+            raw_steps = ["Prepare ingredients and cook."]
+            
+        if not raw_steps:
+            raw_steps = ["Prepare ingredients and cook."]
+        
+        # Map to hold ingredients for each specific step index
+        step_ingredient_map = {idx: [] for idx in range(len(raw_steps))}
+        skip_recipe = False
+        
+        for ing_name in ingr_list:
+            clean_name = clean_ingredient_name(ing_name)
+            
+            # Use dictionary caching to avoid massive repeating difflib
+            if clean_name in match_cache:
+                final_name = match_cache[clean_name]
+            else:
+                final_name = None
+                
+                # 1. Manual Aliases
+                if clean_name in MANUAL_ALIASES:
+                    target = MANUAL_ALIASES[clean_name]
+                    if target.lower() in agribalyse_map:
+                        final_name = agribalyse_map[target.lower()]
+                
+                # 2. Exact Match (Cleaned)
+                if not final_name and clean_name in agribalyse_map:
+                    final_name = agribalyse_map[clean_name]
+                    
+                # 3. TF-IDF Word-Level Match
+                if not final_name:
+                    # clean_name is already lemmatized at the top of the loop!
+                    query_vec = vectorizer.transform([clean_name])
+                    
+                    similarities = cosine_similarity(query_vec, tfidf_matrix).flatten()
+                    
+                    best_idx = similarities.argmax()
+                    best_score = similarities[best_idx]
+                    
+                    # Slightly lower threshold for word-level strictness
+                    if best_score > 0.45: 
+                        # Get the normalized string that matched
+                        best_norm_match = normalized_agribalyse_names[best_idx]
+                        # Trace it back to the original Agribalyse name
+                        original_ag_name = norm_to_original_map[best_norm_match]
+                        # Get the final true string
+                        final_name = agribalyse_map[original_ag_name]
+
+                # Cache the result (even if it's None, so we don't re-search failed strings)
+                match_cache[clean_name] = final_name
+
+            # Proper handling: strictly skip recipe if we can't legitimately map the ingredient
+            if final_name is None:
+                skip_recipe = True
+                break
+
+            ing_group = agribalyse_group_map.get(final_name, "Default").lower()
+            fallback_weight = AUTHORITATIVE_WEIGHTS_KG.get(ing_group, 0.100) # 100g ultimate default
+
+            # --- NEW: FIND THE RIGHT STEP AND EXTRACT ---
+            assigned_step_idx = 0  # Default to step 0 if not found
+            extracted_amount = 0.15 # Default fallback
+            
+            # Find the first step that explicitly mentions the ingredient
+            for idx, step_text in enumerate(raw_steps):
+                if ing_name.lower() in step_text.lower():
+                    assigned_step_idx = idx
+                    # Perform extraction ONLY on the assigned step
+                    extracted_amount = extract_amount_from_step(ing_name, step_text, fallback_weight)
+                    break
+            else:
+                # Fallback: If ingredient name isn't clearly in any step, assign to step 0 
+                # and try to extract from step 0 just in case it was worded weirdly
+                extracted_amount = fallback_weight
+
+            # Append the ingredient to its newly assigned step
+            step_ingredient_map[assigned_step_idx].append({
+                "original_name": ing_name,
+                "name": final_name, 
+                "amount": extracted_amount 
+            })
+
+        if skip_recipe:
+            continue
+            
+        # --- 1. PRE-CALCULATE STEP TIMES ---
+        try:
+            total_dish_minutes = int(row['minutes'])
+        except (ValueError, TypeError):
+            total_dish_minutes = len(raw_steps) * 5 # Safe fallback if missing
+            
+        step_times = []
+        specified_time_total = 0
+        unspecified_indices = []
+        
+        for step_idx, step_text in enumerate(raw_steps):
+            step_lower = step_text.lower()
+            time_match = re.search(r'(\d+)\s*(to|-)?\s*(\d+)?\s*(minute|min|hr|hour)', step_lower)
+            
+            if time_match:
+                val = time_match.group(3) if time_match.group(3) else time_match.group(1)
+                try:
+                    extracted_time = int(val)
+                    if 'hr' in time_match.group(4) or 'hour' in time_match.group(4):
+                        extracted_time *= 60
+                    step_times.append(extracted_time)
+                    specified_time_total += extracted_time
+                except:
+                    step_times.append(None)
+                    unspecified_indices.append(step_idx)
+            else:
+                step_times.append(None)
+                unspecified_indices.append(step_idx)
+                
+        # Calculate remaining time and distribute it uniformly
+        if unspecified_indices:
+            remaining_time = total_dish_minutes - specified_time_total
+            
+            # Ensure we don't assign negative time if the text mentioned a massive time 
+            # (e.g. "marinate 24 hours") but the metadata total time is lower.
+            if remaining_time > 0:
+                # Distribute evenly, ensuring at least 1 minute per step
+                uniform_time = max(1, int(remaining_time / len(unspecified_indices)))
+            else:
+                uniform_time = 2 # Safe fallback
+                
+            for idx in unspecified_indices:
+                step_times[idx] = uniform_time
+
+        # --- 2. BUILD FINAL STEPS DICT ---
+        for step_idx, step_text in enumerate(raw_steps):
+            step_lower = step_text.lower()
+            
+            # Determine Appliance
+            appliance = "Prep Table" # Default
+            if "bake" in step_lower or "oven" in step_lower or "roast" in step_lower:
+                appliance = "Oven"
+            elif "boil" in step_lower or "simmer" in step_lower or "fry" in step_lower or "skillet" in step_lower:
+                appliance = "Stove"
+            elif "microwave" in step_lower:
+                appliance = "Microwave"
+            elif "blend" in step_lower or "puree" in step_lower or "food processor" in step_lower:
+                appliance = "Blender"
+            elif "toast" in step_lower:
+                appliance = "Toaster"
+            elif "chill" in step_lower or "refrigerate" in step_lower:
+                appliance = "Fridge"
+            elif "freeze" in step_lower:
+                appliance = "Freezer"
+
+            # Assign Time (Pulled from our pre-calculated list)
+            step_time_min = step_times[step_idx]
+                
+            # Pull from the mapped ingredients dictionary for this exact step
+            assigned_ingredients = step_ingredient_map.get(step_idx, [])
+
+            step_obj = {
+                "step_name": f"Step {step_idx + 1}",
+                "description": step_text.capitalize(),
+                "appliance": appliance,
+                "time_min": step_time_min,
+                "ingredients": assigned_ingredients
+            }
+            recipe_dict['steps'].append(step_obj)
+            
+        recipes_list.append(recipe_dict)
+        
+    with open(OUT_RECIPES, 'w') as f:
+        json.dump(recipes_list, f, indent=2)
+        
+    print(f"Successfully saved {len(recipes_list)} purely verified recipes to {OUT_RECIPES}")
+
+def main():
+    print("========================================")
+    print(" Data Conversion Pipeline")
+    print("========================================")
+    
+    # 1. Create Base Data
+    create_appliances_db()
+    ingredients_df = create_ingredients_db()
+    
+    # 2. Process Recipes
+    if ingredients_df is not None:
+        process_recipes(ingredients_df)
+    
+    print("\nData conversion complete. Ready for simulation.")
+
+if __name__ == "__main__":
+    main()
+
