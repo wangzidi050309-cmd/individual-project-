@@ -1,0 +1,529 @@
+import pandas as pd
+import json
+import os
+
+# ---------------------------------------------------------------------
+
+class Ingredient:
+    def __init__(self, name, co2_per_kg):
+        self.name = name
+        self.co2_per_kg = float(co2_per_kg)
+        self.carbon_tax_surcharge = 0.0 # NEW: Financial tax ($) per kg of this ingredient
+
+class Appliance:
+    def __init__(self, name, kw):
+        self.name = name
+        self.kw = float(kw)
+
+class RecipeStep:
+    def __init__(self, name, description, appliance=None):
+        self.name = name
+        self.description = description
+        self.appliance = appliance
+        self.inputs = []
+        self.time = 0.0
+
+    def add_ingredient(self, ingredient, amount_kg, original_name=""):
+        self.inputs.append({'ingredient': ingredient, 'amount': amount_kg, 'original_name': original_name})
+
+    def set_duration(self, time_min):
+        self.time = time_min
+
+    # Add the grid_co2_per_kwh parameter (US average is ~0.385 kgCO2/kWh)
+    def calculate_metrics(self, grid_co2_per_kwh=0.385):
+        emissions = 0.0
+        mass = 0.0
+        kwh_used = 0.0
+        step_tax_cost = 0.0 # NEW: Track ingredient taxes in this step
+        details = {'ingredients': [], 'appliance': None}
+        
+        # 1. Ingredient Calculation
+        for item in self.inputs:
+            ing = item['ingredient']
+            amt = item['amount']
+            orig = item['original_name']
+            
+            ing_emissions = amt * ing.co2_per_kg
+            ing_tax = amt * ing.carbon_tax_surcharge # Calculate the financial penalty
+            print(amt, ing.carbon_tax_surcharge)
+            
+            emissions += ing_emission
+            step_tax_cost += ing_tax
+            mass += amt
+            
+            details['ingredients'].append({
+                'original': orig,
+                'mapped': ing.name,
+                'amount': amt,
+                'emission': ing_emissions,
+                'tax_cost': ing_tax
+            })
+            
+        # 2. Energy & Emissions Calculation
+        if self.appliance and self.time > 0 and self.appliance.name != "Prep Table":
+            kwh_used = self.appliance.kw * (self.time / 60.0)
+            app_emissions = kwh_used * grid_co2_per_kwh
+            emissions += app_emission
+            
+            details['appliance'] = {
+                'name': self.appliance.name,
+                'time_min': self.time,
+                'kwh': kwh_used,
+                'emission': app_emission
+            }
+        
+        return {
+            'emissions': emissions, 
+            'mass': mass,
+            'time': self.time,
+            'kwh': kwh_used,
+            'tax_cost': step_tax_cost, # Return the tax up to the Recipe
+            'details': details
+        }
+
+class Recipe:
+    def __init__(self, name, price):
+        self.name = name
+        self.price = price
+        self.steps = []
+
+    def add_step(self, step):
+        self.steps.append(step)
+
+    def evaluate(self, labor_rate_per_min=0.25, electricity_price_per_kwh=0.20, grid_co2_per_kwh=0.385):
+        total = {'emissions': 0.0, 'time': 0.0, 'mass': 0.0, 'kwh': 0.0, 'tax_cost': 0.0}
+        breakdown = []
+        labor_time = 0.0
+        
+        for step in self.steps:
+            m = step.calculate_metrics(grid_co2_per_kwh)
+            
+            total['emissions'] += m['emissions']
+            total['time'] += m['time']
+            total['mass'] += m['mass']
+            total['kwh'] += m['kwh'] 
+            total['tax_cost'] += m['tax_cost'] # Accumulate the new tax
+            
+            if step.appliance is None or step.appliance.name == "Prep Table":
+                labor_time += m['time']
+                
+            breakdown.append({
+                'step_name': step.name,
+                'description': step.description,
+                'step_emissions': m['emissions'],
+                'details': m['details']
+            })
+            
+        food_cost = self.price * 0.30
+        labor_cost = labor_time * labor_rate_per_min
+        appliance_cost = total['kwh'] * electricity_price_per_kwh
+        carbon_tax = total['tax_cost']
+        
+        # Net Profit now deducts the actual Carbon Tax
+        # print(carbon_tax, self.price)
+        net_profit = self.price - food_cost - labor_cost - appliance_cost - carbon_tax
+        
+        return {
+            'Dish': self.name,
+            'Price': self.price,
+            'Food_Cost': round(food_cost, 2),
+            'Labor_Cost': round(labor_cost, 2),
+            'Appliance_Cost': round(appliance_cost, 3), 
+            'Carbon_Tax': round(carbon_tax, 2), # Expose this for your plots
+            'Net_Profit': round(net_profit, 2),
+            'Emissions': round(total['emissions'], 3),
+            'Time': round(total['time'], 1),
+            'Prep_Time': round(labor_time, 1),
+            'Mass_KG': round(total['mass'], 2),
+            'Breakdown': breakdown
+        }
+
+# ==========================================
+# NEW: Real Data Manager (Data Loading Layer)
+# ==========================================
+
+class DataManager:
+    def __init__(self):
+        self.ingredients_db = {} # Dictionary {name: IngredientObject}
+        self.appliances_db = {}  # Dictionary {name: ApplianceObject}
+        self.menu_list = []      # List [RecipeObject]
+
+    def load_ingredients(self, filepath):
+        """Read a CSV file and convert it to Ingredient objects using Pandas"""
+        if not os.path.exists(filepath):
+            print(f"Error: File {filepath} not found.")
+            return
+            
+        df = pd.read_csv(filepath)
+        print(f"Loading {len(df)} ingredients...")
+        
+        for _, row in df.iterrows():
+            ing = Ingredient(
+                name=row['name'], 
+                co2_per_kg=row['co2_per_kg']
+            )
+            self.ingredients_db[row['name']] = ing
+
+    def load_appliances(self, filepath):
+        """Read a CSV file and convert it to Appliance objects"""
+        if not os.path.exists(filepath): return
+        
+        df = pd.read_csv(filepath)
+        print(f"Loading {len(df)} appliances...")
+        
+        for _, row in df.iterrows():
+            # Extract 'kw' instead of 'co2_per_hour'
+            app = Appliance(
+                name=row['name'], 
+                kw=row['kw'] 
+            )
+            self.appliances_db[row['name']] = app
+
+    def build_menu_from_json(self, filepath):
+        """Read a JSON file and build one-way Recipe objects using the loaded DB"""
+        if not os.path.exists(filepath): return
+        
+        with open(filepath, 'r') as f:
+            data = json.load(f)
+            
+        print(f"Building {len(data)} recipes...")
+        
+        for recipe_data in data:
+            # 1. Create the dish object
+            dish = Recipe(recipe_data['name'], recipe_data['price'])
+            
+            # 2. Iterate through the steps in the JSON
+            for step in recipe_data['steps']:
+                # Look up the corresponding appliance object (default to None if not found)
+                app_name = step.get('appliance')
+                app_obj = self.appliances_db.get(app_name)
+                
+                if app_name and not app_obj:
+                    print(f"Warning: Appliance '{app_name}' not found in DB.")
+
+                # Create the node
+                step_obj_inst = RecipeStep(step['step_name'], step['description'], appliance=app_obj)
+                step_obj_inst.set_duration(time_min=step['time_min'])
+                
+                # 3. Iterate through the ingredients in the step and add them to the node
+                if 'ingredients' in step:
+                    for ing_item in step['ingredients']:
+                        ing_name = ing_item['name']
+                        orig_name = ing_item.get('original_name', ing_name)
+                        ing_obj = self.ingredients_db.get(ing_name)
+                        
+                        if ing_obj:
+                            step_obj_inst.add_ingredient(ing_obj, ing_item['amount'], orig_name)
+                        else:
+                            # Silently ignore warnings for now to reduce clutter, or keep if critical
+                            pass
+                            # print(f"Warning: Ingredient '{ing_name}' not found in DB.")
+                
+                dish.add_step(step_obj_inst)
+            
+            self.menu_list.append(dish)
+
+from ortools.sat.python import cp_model
+
+class AdvancedTimeScheduler:
+    def __init__(self, evaluated_menu):
+        """
+        evaluated_menu: List of dictionaries returned by Recipe.evaluate()
+        """
+        self.menu = evaluated_menu
+
+    def optimize_schedule(
+        self,
+        max_time_mins=180,       # e.g., 3 hour shift
+        num_prep_cooks=2,        # 2 workers can prep 2 different things at once
+        num_ovens=1,             # 1 oven available
+        num_stoves=4,            # 4 stove burners available
+        max_co2_kg=10,           # The epsilon constraint (limit CO2)
+        max_potential_per_dish=20 # Max pool size to prevent infinite memory
+    ):
+        print("\n========================================")
+        print(" TIME-BASED SCHEDULING ALGORITHM (OR-Tools)")
+        print("========================================")
+        
+        model = cp_model.CpModel()
+        
+        # Resource tracking arrays
+        prep_intervals = []
+        oven_intervals = []
+        stove_intervals = []
+        
+        # Objective tracking arrays
+        profit_terms = []
+        co2_terms = []
+        service_time_terms = [] # NEW: Tracks the total duration of each dish
+        
+        # Dictionary to store results for extraction later
+        job_tracking = {} 
+
+        # 1. BUILD THE MODEL
+        for dish_idx, dish in enumerate(self.menu):
+            breakdown = dish.get('Breakdown', [])
+            if isinstance(breakdown, str):
+                try:
+                    breakdown = ast.literal_eval(breakdown)
+                except:
+                    print(f"Warning: Could not parse breakdown for {dish['Dish']}")
+                    continue
+
+            # --- BUILD CHRONOLOGICAL INTERVALS ---
+            for instance in range(max_potential_per_dish):
+                job_id = f"D{dish_idx}_I{instance}"
+                is_active = model.NewBoolVar(f'{job_id}_active')
+                
+                dish_profit = dish.get('Net_Profit', 0)
+                profit_terms.append(int(dish.get('Net_Profit', 0) * 100) * is_active) 
+                co2_terms.append(int(dish.get('Emissions', 0) * 1000) * is_active)    
+                
+                job_tracking[job_id] = {'name': dish['Dish'], 'is_active': is_active, 'steps': [], 'profit': dish_profit}
+                
+                previous_end = None
+                start_vars = [] # NEW: Store start times to calculate duration
+                end_vars = []   # NEW: Store end times to calculate duration
+                
+                for step_idx, step in enumerate(breakdown):
+                    # We can now confidently grab the exact time for THIS specific step
+                    duration = int(step['step_time']) 
+                    
+                    app = step['details'].get('appliance')
+                    app_name = app['name'] if app else "Prep Table"
+                    
+                    start_var = model.NewIntVar(0, max_time_mins, f'{job_id}_s{step_idx}_start')
+                    end_var = model.NewIntVar(0, max_time_mins, f'{job_id}_s{step_idx}_end')
+                    interval_var = model.NewOptionalIntervalVar(
+                        start_var, duration, end_var, is_active, f'{job_id}_s{step_idx}_interval'
+                    )
+                    
+                    if previous_end is not None:
+                        model.Add(start_var >= previous_end).OnlyEnforceIf(is_active)
+                    previous_end = end_var
+
+                    start_vars.append(start_var) # NEW
+                    end_vars.append(end_var)     # NEW
+
+                    job_tracking[job_id]['steps'].append({
+                        'appliance': app_name,
+                        'start': start_var,
+                        'end': end_var
+                    })
+                    
+                    # Route interval to proper capacity constraint array
+                    if app_name == "Oven":
+                        oven_intervals.append(interval_var)
+                    elif app_name == "Stove":
+                        stove_intervals.append(interval_var)
+                    else: 
+                        prep_intervals.append(interval_var)
+
+                    # NEW: Calculate total service time (End of last step - Start of first step)
+                    if start_vars and end_vars:
+                        service_time = model.NewIntVar(0, max_time_mins, f'{job_id}_service_time')
+                        model.Add(service_time == end_vars[-1] - start_vars[0]).OnlyEnforceIf(is_active)
+                        model.Add(service_time == 0).OnlyEnforceIf(is_active.Not())
+                        service_time_terms.append(service_time)
+
+        # 4. CAPACITY CONSTRAINTS: 
+        # No matter how many active intervals overlap at any minute, they cannot exceed capacity.
+        # Demands are 1 unit per interval.
+        model.AddCumulative(prep_intervals, [1]*len(prep_intervals), num_prep_cooks)
+        model.AddCumulative(oven_intervals, [1]*len(oven_intervals), num_ovens)
+        model.AddCumulative(stove_intervals, [1]*len(stove_intervals), num_stoves)
+
+        # 5. CROSS-OBJECTIVE CONSTRAINT (Epsilon Constraint)
+        # Limit total CO2 to the user's max budget
+        model.Add(sum(co2_terms) <= int(max_co2_kg * 1000))
+
+        # 6. SET OBJECTIVE: Maximize Profit
+        model.Maximize(sum(profit_terms) - sum(service_time_terms))
+
+        # 7. SOLVE THE MODEL
+        solver = cp_model.CpSolver()
+        # Optional: Add a time limit so the solver doesn't hang forever on massive menus
+        solver.parameters.max_time_in_seconds = 60.0 
+        status = solver.Solve(model)
+
+        # 8. OUTPUT RESULTS
+        if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+            # Calculate pure financial profit (ignoring the time penalties)
+            total_profit = 0.0
+            production_counts = {}
+            
+            for job_id, data in job_tracking.items():
+                if solver.Value(data['is_active']):
+                    name = data['name']
+                    production_counts[name] = production_counts.get(name, 0) + 1
+                    total_profit += data['profit']
+            
+            print(f"Solver Status: {solver.status_name(status)}")
+            print(f"Projected Net Profit: ${total_profit:.2f}")
+            
+            print("\n--- Final Production Plan ---")
+            for name, count in production_counts.items():
+                print(f"  Make {count}x {name}")
+
+            # --- GENERATE GANTT CHART ---
+            import matplotlib.pyplot as plt
+            
+            fig, ax = plt.subplots(figsize=(12, 6))
+            yticks, yticklabels = [], []
+            y_pos = 10
+            
+            for job_id, data in job_tracking.items():
+                if solver.Value(data['is_active']):
+                    yticks.append(y_pos)
+                    # Label the Y-axis with the Dish Name and its Instance ID
+                    yticklabels.append(f"{data['name']} ({job_id.split('_')[-1]})")
+                    
+                    for step in data['steps']:
+                        start_time = solver.Value(step['start'])
+                        duration = solver.Value(step['end']) - start_time
+                        app = step['appliance']
+                        
+                        # Color code based on the appliance used
+                        if app == 'Oven': color = 'tab:red'
+                        elif app == 'Stove': color = 'tab:orange'
+                        else: color = 'tab:blue' # Prep Table
+                        
+                        # Draw the bar
+                        ax.broken_barh([(start_time, duration)], (y_pos - 4, 8), 
+                                       facecolors=color, edgecolor='black')
+                        # Add text inside the bar
+                        ax.text(start_time + duration/2, y_pos, app[:5], 
+                                ha='center', va='center', color='white', fontsize=8)
+                        
+                    y_pos += 10
+                    
+            ax.set_yticks(yticks)
+            ax.set_yticklabels(yticklabels)
+            ax.set_xlabel('Time (Minutes)')
+            ax.set_title('Kitchen Production Gantt Chart')
+            ax.grid(True, axis='x', linestyle='--', alpha=0.6)
+            plt.tight_layout()
+            plt.show()
+                
+            print("\nNote: Full Gantt chart timeline data is embedded in the solver variables.")
+        else:
+            print("No feasible schedule found. Constraints (time, resources, or CO2) are too strict.")
+
+import pandas as pd
+
+def rank_by_combined_score(results_list, output_filename="scored_dishes.csv"):
+    if not results_list:
+        print("No results to score.")
+        return results_list
+        
+    df = pd.DataFrame(results_list)
+    
+    # 1. Extract Min and Max boundaries
+    min_profit = df['Net_Profit'].min()
+    max_profit = df['Net_Profit'].max()
+    
+    min_co2 = df['Emissions'].min()
+    max_co2 = df['Emissions'].max()
+    
+    # Safely handle ranges to prevent division by zero if all dishes are identical
+    profit_range = (max_profit - min_profit) if (max_profit - min_profit) != 0 else 1.0
+    co2_range = (max_co2 - min_co2) if (max_co2 - min_co2) != 0 else 1.0
+    
+    # 2. Scale to 0-1
+    df['Scaled_Profit'] = (df['Net_Profit'] - min_profit) / profit_range
+    df['Scaled_Emissions'] = (max_co2 - df['Emissions']) / co2_range # Inverted so lower CO2 = higher score
+    
+    # 3. Calculate Combined Score (Equal 50/50 weighting)
+    df['Combined_Score'] = (df['Scaled_Profit'] + df['Scaled_Emissions']) / 2.0
+    
+    # 4. Sort descending (Best overall dishes at the top)
+    df_sorted = df.sort_values(by='Combined_Score', ascending=False)
+    
+    # 5. Save a clean version to CSV (excluding the massive breakdown dictionaries)
+    cols_to_save = [
+        'Dish', 'Price', 'Net_Profit', 'Emissions', 
+        'Scaled_Profit', 'Scaled_Emissions', 'Combined_Score'
+    ]
+    df_sorted[cols_to_save].to_csv(output_filename, index=False)
+    
+    print("\n========================================")
+    print(f" TOP 5 DISHES BY COMBINED SCORE")
+    print("========================================")
+    print(df_sorted[['Dish', 'Combined_Score', 'Net_Profit', 'Emissions']].head(5).to_string(index=False))
+    print(f"-> Full ranking saved to {output_filename}")
+    
+    # Return the updated list of dictionaries (now including the scores)
+    return df_sorted.to_dict('records')
+
+# ==========================================
+# Run the main program
+# ==========================================
+
+from optimization import ParetoAnalyzer
+
+def run_real_world_simulation():
+    manager = DataManager()
+    
+    # 1. Load the base data (make sure the CSV files are in the same directory)
+    # You can create these CSV files in Excel first, then save them as CSV UTF-8 format
+    manager.load_ingredients('db_ingredients.csv')
+    manager.load_appliances('db_appliances.csv')
+    
+    # 2. Build the menu graph model
+    manager.build_menu_from_json('db_recipes.json')
+    
+    # 3. Output the results
+    print("\n" + "="*40)
+    print("       MENU ANALYSIS REPORT       ")
+    print("="*40)
+    
+    results_df = []
+    
+    for dish in manager.menu_list:
+        res = dish.evaluate()
+        results_df.append(res)
+        
+        print(f"\n[Dish]: {res['Dish']}")
+        print(f" - Gross Price: ${res['Price']}")
+        print(f" - Labor Cost: ${res['Labor_Cost']} ({res['Time']} min)")
+        print(f" - Net Profit: ${res['Net_Profit']}")
+        print(f" - Total Carbon: {res['Emissions']} kgCO2e")
+        print(f" - Total Mass: {res['Mass_KG']} kg")
+        
+        print("   --- Emissions Breakdown ---")
+        for step_data in res['Breakdown']:
+            if step_data['step_emissions'] > 0:
+                print(f"   [{step_data['step_name']}]: {step_data['description']}")
+                print(f"      (Step Total: {round(step_data['step_emissions'], 3)} kgCO2e)")
+                
+                details = step_data['details']
+                for ing in details['ingredients']:
+                    print(f"      - {ing['original']} -> [{ing['mapped']}]: {round(ing['emission'], 3)} kgCO2e "
+                          f"({ing['amount']} kg)")
+                          
+                if details['appliance']:
+                    app = details['appliance']
+                    print(f"      - {app['name']}: {round(app['emission'], 3)} kgCO2e "
+                          f"({app['time_min']} min)")
+
+    # If you want to save the results back to CSV for report figures:
+    pd.DataFrame(results_df).to_csv('final_results.csv', index=False)
+    # --- NEW: SCORE AND SORT ---
+    # This adds the 0-1 scores and saves the sorted list to a CSV
+    rank_by_combined_score(results_df, output_filename="scored_menu.csv")
+
+    # 4. Run the optimization analysis (Pareto Analysis)
+    print("\nRunning Multi-Objective Optimization...")
+    optimizer = ParetoAnalyzer(manager.menu_list)
+    optimizer.print_pareto_report()
+
+    scheduler = AdvancedTimeScheduler(results_df[-3:])
+    scheduler.optimize_schedule()
+
+if __name__ == "__main__":
+    # ------------------------------------------------------------------
+    # The data generation lines have been removed to allow using external files.
+    # Ensure db_ingredients.csv, db_appliances.csv, and db_recipes.json exist.
+    # ------------------------------------------------------------------
+
+    run_real_world_simulation()
