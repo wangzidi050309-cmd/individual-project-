@@ -1,0 +1,78 @@
+class ParetoAnalyzer:
+    def __init__(self, menu_list, labor_rate_per_min=0.25):
+        """
+        Initialize with a list of Recipe objects.
+        """
+        self.menu_list = menu_list
+        self.labor_rate_per_min = labor_rate_per_min
+        self.data = []
+        self._extract_data()
+
+    def _extract_data(self):
+        """Extract Profit and Carbon metrics for analysis."""
+        for dish in self.menu_list:
+            metrics = dish.evaluate(labor_rate_per_min=self.labor_rate_per_min)
+            self.data.append({
+                'name': metrics['Dish'],
+                'profit': metrics['Net_Profit'],
+                'carbon': metrics['Emissions'],
+                'price': metrics['Price'],
+                'object': dish
+            })
+
+    def find_pareto_frontier(self):
+        """
+        Identify the Pareto Frontier.
+        Objectives: Maximize Profit, Minimize Carbon.
+        Returns a list of non-dominated recipe dictionaries.
+        """
+        population = self.data
+        pareto_front = []
+
+        for i, candidate in enumerate(population):
+            is_dominated = False
+            for j, other in enumerate(population):
+                if i == j:
+                    continue
+                
+                # Check if 'other' dominates 'candidate'
+                # Condition: other has >= profit AND <= carbon
+                # AND strictly better in at least one
+                if (other['profit'] >= candidate['profit'] and 
+                    other['carbon'] <= candidate['carbon'] and
+                    (other['profit'] > candidate['profit'] or other['carbon'] < candidate['carbon'])):
+                    is_dominated = True
+                    break
+            
+            if not is_dominated:
+                pareto_front.append(candidate)
+        
+        # Sort by Profit for display
+        pareto_front.sort(key=lambda x: x['profit'])
+        return pareto_front
+
+    def print_pareto_report(self):
+        frontier = self.find_pareto_frontier()
+        
+        # Calculate BAU Baseline
+        if len(self.data) > 0:
+            avg_profit = sum(d['profit'] for d in self.data) / len(self.data)
+            avg_carbon = sum(d['carbon'] for d in self.data) / len(self.data)
+        else:
+            avg_profit, avg_carbon = 0.0, 0.0
+            
+        print("\n" + "="*70)
+        print("          MULTI-OBJECTIVE OPTIMIZATION REPORT          ")
+        print(" Objectives: Maximize Profit | Minimize Carbon")
+        print("="*70)
+        print(f" Dataset 'Business As Usual' Baseline ({len(self.data)} recipes):")
+        print(f"   -> Average Profit: ${avg_profit:.2f}")
+        print(f"   -> Average Carbon: {avg_carbon:.3f} kgCO2e")
+        print("-" * 70)
+        print(f"{'Dish Name':<42} | {'Profit':>9} | {'Carbon':>9}")
+        print("-" * 70)
+        
+        for item in frontier:
+            print(f"{item['name']:<42} | ${item['profit']:>8.2f} | {item['carbon']:>9.3f}")
+        print("-" * 70)
+        print(f"Optimal Lineup: {len(frontier)} recipes defining the modern frontier.")
